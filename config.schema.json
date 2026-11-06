@@ -29,7 +29,8 @@
               "type": "string",
               "title": "Connection Type",
               "oneOf": [
-                { "title": "Wi-Fi CLI (EKG Pro)", "enum": ["wifi"] },
+                { "title": "Wi-Fi native API (EKG Pro firmware 1.2.26)", "enum": ["native"] },
+                { "title": "Wi-Fi CLI (EKG Pro firmware 1.1.x)", "enum": ["wifi"] },
                 { "title": "BLE bridge (EKG+ / EKG Pro)", "enum": ["ble"] }
               ],
               "default": "wifi"
@@ -40,6 +41,14 @@
               "description": "Wi-Fi: base URL of the kettle (no trailing slash). BLE: base URL of the bridge.",
               "default": "http://192.168.1.32",
               "pattern": "^https?://"
+            },
+            "pollInterval": {
+              "type": "number",
+              "title": "Poll Interval (seconds)",
+              "description": "Native API only: how often the kettle's state is read in the background. HomeKit is answered from the last reading.",
+              "default": 15,
+              "minimum": 5,
+              "condition": { "functionBody": "return model.kettles[arrayIndices].connection === 'native';" }
             },
             "minTemp": {
               "type": "number",

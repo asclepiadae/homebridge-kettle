@@ -1,6 +1,7 @@
 'use strict'
 
 const StaggEKGProClient = require('./lib/stagg-ekg-pro-client')
+const StaggEKGProNativeClient = require('./lib/stagg-ekg-pro-native-client')
 
 module.exports = (api) => {
     api.registerPlatform('homebridge-kettle-pro', 'StaggKettle', StaggKettlePlatform);
@@ -56,11 +57,120 @@ class StaggKettlePlatform {
         const config = accessory.context.config;
         const mode = String(config.connection || config.mode || '').toLowerCase();
         const { Service, Characteristic } = this.api.hap;
-        if (mode === 'wifi') {
+        if (mode === 'native') {
+            new StaggEKGProNativeHandler(this.log, config, accessory, this.api);
+        } else if (mode === 'wifi') {
             new StaggEKGProWifiHandler(this.log, config, accessory, Service, Characteristic);
         } else {
             new StaggEKGPlusHandler(this.log, config, accessory, Service, Characteristic);
         }
+    }
+}
+
+
+// Firmware 1.2.26: the CLI is muted, so state comes from the native `/temp` endpoint.
+// The kettle turns its Wi-Fi off while heating or holding, so it is polled in the
+// background and HomeKit reads answer from the last known state instead of waiting
+// on the network.
+class StaggEKGProNativeHandler {
+    constructor(log, config, accessory, api) {
+        const { Service, Characteristic, HapStatusError, HAPStatus } = api.hap;
+        this.log = log;
+        this.name = config.name;
+        this.client = new StaggEKGProNativeClient(config.url);
+        this.minTemp = typeof config.minTemp === 'number' ? config.minTemp : 40;
+        this.maxTemp = typeof config.maxTemp === 'number' ? config.maxTemp : 100;
+        this.heating = null;
+        this.currentTemp = null;
+        this.targetTemp = null;
+        this.online = null;
+
+        accessory.getService(Service.AccessoryInformation)
+            .setCharacteristic(Characteristic.Manufacturer, 'Fellow')
+            .setCharacteristic(Characteristic.Model, 'Stagg EKG Pro')
+            .setCharacteristic(Characteristic.SerialNumber, '123-456-789');
+
+        const service = accessory.getService(Service.Thermostat)
+            || accessory.addService(Service.Thermostat);
+
+        const known = (value) => {
+            if (value === null) throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+            return value;
+        };
+
+        this.currentState = service.getCharacteristic(Characteristic.CurrentHeatingCoolingState)
+            .setProps({ validValues: [0, 1] })
+            .onGet(() => known(this.heating === null ? null : Number(this.heating)));
+
+        this.targetState = service.getCharacteristic(Characteristic.TargetHeatingCoolingState)
+            .setProps({ validValues: [0, 1] })
+            .onGet(() => known(this.heating === null ? null : Number(this.heating)))
+            .onSet(async (value) => {
+                if (this.heating !== null && value === Number(this.heating)) return;
+                this.log.warn(`${this.name}: firmware 1.2.26 can't be switched on or off over Wi-Fi; use the kettle or the Fellow app.`);
+                setTimeout(() => {
+                    if (this.heating !== null) this.targetState.updateValue(Number(this.heating));
+                }, 100);
+                throw new HapStatusError(HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+            });
+
+        this.targetTempChar = service.getCharacteristic(Characteristic.TargetTemperature)
+            .setProps({ minValue: this.minTemp, maxValue: this.maxTemp, minStep: 0.5 })
+            .onGet(() => known(this.targetTemp))
+            .onSet(async (value) => {
+                try {
+                    const actual = await this.client.setTargetTemp(value);
+                    this.targetTemp = this._clampTarget(actual);
+                } catch (err) {
+                    this.log.warn(`${this.name}: could not set the target temperature to ${value} °C: ${err.message}`);
+                    throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+                }
+            });
+
+        this.currentTempChar = service.getCharacteristic(Characteristic.CurrentTemperature)
+            .setProps({ minValue: 0, maxValue: 120 })
+            .onGet(() => known(this.currentTemp));
+
+        service.getCharacteristic(Characteristic.TemperatureDisplayUnits)
+            .onGet(async () => 0)
+            .onSet(async () => {});
+
+        const seconds = Math.max(5, Number(config.pollInterval) || 15);
+        this._poll();
+        const timer = setInterval(() => this._poll(), seconds * 1000);
+        api.on('shutdown', () => clearInterval(timer));
+    }
+
+    _clampTarget(value) {
+        return Math.min(this.maxTemp, Math.max(this.minTemp, Math.round(value * 2) / 2));
+    }
+
+    async _poll() {
+        let status;
+        try {
+            status = await this.client.status();
+        } catch (err) {
+            if (this.online !== false) {
+                this.log.warn(`${this.name}: no answer from ${this.client.root}/temp (${err.message}). `
+                    + 'The kettle turns its Wi-Fi off while heating or holding; HomeKit shows the last known state until it answers again.');
+            }
+            this.online = false;
+            return;
+        }
+        if (this.online === false) this.log.info(`${this.name}: answering again.`);
+        this.online = true;
+
+        if (status.heating !== null) {
+            this.heating = status.heating;
+            this.currentState.updateValue(Number(this.heating));
+            this.targetState.updateValue(Number(this.heating));
+        }
+        if (status.currentTemp !== null) {
+            this.currentTemp = Math.min(120, Math.max(0, status.currentTemp));
+            this.currentTempChar.updateValue(this.currentTemp);
+        }
+        this.targetTemp = this._clampTarget(status.targetTemp);
+        this.targetTempChar.updateValue(this.targetTemp);
     }
 }
 
